@@ -1,0 +1,136 @@
+diff --git a/ssl/record/methods/tls13_meth.c b/ssl/record/methods/tls13_meth.c
+index 6bbba84d0d..10c21a7990 100644
+--- a/ssl/record/methods/tls13_meth.c
++++ b/ssl/record/methods/tls13_meth.c
+@@ -40,6 +40,16 @@ static int tls13_set_crypto_state(OSSL_RECORD_LAYER *rl, int level,
+ 
+     memcpy(rl->iv, iv, ivlen);
+ 
++#ifndef OPENSSL_NO_COMP
++    if (comp != NULL) {
++        rl->compctx = COMP_CTX_new(comp);
++        if (rl->compctx == NULL) {
++            ERR_raise(ERR_LIB_SSL, SSL_R_COMPRESSION_LIBRARY_ERROR);
++            return OSSL_RECORD_RETURN_FATAL;
++        }
++    }
++#endif
++
+     /* Integrity only */
+     if (EVP_CIPHER_is_a(ciph, "NULL") && mactype == NID_hmac && md != NULL) {
+         mac = EVP_MAC_fetch(rl->libctx, "HMAC", rl->propq);
+diff --git a/ssl/record/methods/tls_common.c b/ssl/record/methods/tls_common.c
+index 80d4477bd0..bb467d83be 100644
+--- a/ssl/record/methods/tls_common.c
++++ b/ssl/record/methods/tls_common.c
+@@ -1107,6 +1107,24 @@ int tls13_common_post_process_record(OSSL_RECORD_LAYER *rl, TLS_RL_RECORD *rec)
+         return 0;
+     }
+ 
++    if (rl->compctx != NULL) {
++        if (rec->length > SSL3_RT_MAX_COMPRESSED_LENGTH) {
++            RLAYERfatal(rl, SSL_AD_RECORD_OVERFLOW,
++                        SSL_R_COMPRESSED_LENGTH_TOO_LONG);
++            return 0;
++        }
++        if (!tls_do_uncompress(rl, rec)) {
++            RLAYERfatal(rl, SSL_AD_DECOMPRESSION_FAILURE,
++                        SSL_R_BAD_DECOMPRESSION);
++            return 0;
++        }
++    }
++
++    if (rec->length > SSL3_RT_MAX_PLAIN_LENGTH) {
++        RLAYERfatal(rl, SSL_AD_RECORD_OVERFLOW, SSL_R_DATA_LENGTH_TOO_LONG);
++        return 0;
++    }
++
+     return 1;
+ }
+ 
+diff --git a/ssl/statem/statem_clnt.c b/ssl/statem/statem_clnt.c
+index 436b397346..80ad9d080c 100644
+--- a/ssl/statem/statem_clnt.c
++++ b/ssl/statem/statem_clnt.c
+@@ -1321,9 +1321,7 @@ CON_FUNC_RETURN tls_construct_client_hello(SSL_CONNECTION *s, WPACKET *pkt)
+     }
+ #ifndef OPENSSL_NO_COMP
+     if (ssl_allow_compression(s)
+-            && sctx->comp_methods
+-            && (SSL_CONNECTION_IS_DTLS(s)
+-                || s->s3.tmp.max_ver < TLS1_3_VERSION)) {
++            && sctx->comp_methods) {
+         int compnum = sk_SSL_COMP_num(sctx->comp_methods);
+         for (i = 0; i < compnum; i++) {
+             comp = sk_SSL_COMP_value(sctx->comp_methods, i);
+@@ -1548,12 +1546,6 @@ MSG_PROCESS_RETURN tls_process_server_hello(SSL_CONNECTION *s, PACKET *pkt)
+     }
+ 
+     if (SSL_CONNECTION_IS_TLS13(s) || hrr) {
+-        if (compression != 0) {
+-            SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER,
+-                     SSL_R_INVALID_COMPRESSION_ALGORITHM);
+-            goto err;
+-        }
+-
+         if (session_id_len != s->tmp_session_id_len
+                 || memcmp(PACKET_data(&session_id), s->tmp_session_id,
+                           session_id_len) != 0) {
+diff --git a/ssl/statem/statem_srvr.c b/ssl/statem/statem_srvr.c
+index c6abfd3319..196ff09b29 100644
+--- a/ssl/statem/statem_srvr.c
++++ b/ssl/statem/statem_srvr.c
+@@ -2017,21 +2017,9 @@ static int tls_early_post_process_client_hello(SSL_CONNECTION *s)
+      * algorithms from the client, starting at q.
+      */
+     s->s3.tmp.new_compression = NULL;
+-    if (SSL_CONNECTION_IS_TLS13(s)) {
+-        /*
+-         * We already checked above that the NULL compression method appears in
+-         * the list. Now we check there aren't any others (which is illegal in
+-         * a TLSv1.3 ClientHello.
+-         */
+-        if (clienthello->compressions_len != 1) {
+-            SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER,
+-                     SSL_R_INVALID_COMPRESSION_ALGORITHM);
+-            goto err;
+-        }
+-    }
+ #ifndef OPENSSL_NO_COMP
+     /* This only happens if we have a cache hit */
+-    else if (s->session->compress_meth != 0) {
++    if (s->session->compress_meth != 0) {
+         int m, comp_id = s->session->compress_meth;
+         unsigned int k;
+         /* Perform sanity checks on resumed compression algorithm */
+@@ -2454,7 +2442,7 @@ CON_FUNC_RETURN tls_construct_server_hello(SSL_CONNECTION *s, WPACKET *pkt)
+ #ifdef OPENSSL_NO_COMP
+     compm = 0;
+ #else
+-    if (usetls13 || s->s3.tmp.new_compression == NULL)
++    if (s->s3.tmp.new_compression == NULL)
+         compm = 0;
+     else
+         compm = s->s3.tmp.new_compression->id;
+diff --git a/ssl/tls13_enc.c b/ssl/tls13_enc.c
+index 7846c73a86..6a57e7e5c2 100644
+--- a/ssl/tls13_enc.c
++++ b/ssl/tls13_enc.c
+@@ -728,11 +728,16 @@ int tls13_change_cipher_state(SSL_CONNECTION *s, int which)
+                ? OSSL_RECORD_PROTECTION_LEVEL_HANDSHAKE
+                : OSSL_RECORD_PROTECTION_LEVEL_APPLICATION);
+ 
++    const SSL_COMP *comp = NULL;
++#ifndef OPENSSL_NO_COMP
++    comp = s->s3.tmp.new_compression;
++#endif
++
+     if (!ssl_set_new_record_layer(s, s->version,
+                                   direction,
+                                   level, secret, hashlen, key, keylen, iv,
+                                   ivlen, NULL, 0, cipher, taglen,
+-                                  mac_pkey_type, mac_md, NULL, md)) {
++                                  mac_pkey_type, mac_md, comp, md)) {
+         /* SSLfatal already called */
+         goto err;
+     }
